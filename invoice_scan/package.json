@@ -1,0 +1,16 @@
+{
+  "name": "payment-scan",
+  "version": "2.0.0",
+  "description": "Automated Gmail invoice detection and tracking using Claude agents",
+  "type": "module",
+  "scripts": {
+    "auth": "node gmail-auth.js",
+    "detect": "node detector-agent.js",
+    "paid": "node marker-agent.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "googleapis": "^144.0.0"
+  }
+}
