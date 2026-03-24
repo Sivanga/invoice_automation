@@ -4,7 +4,16 @@
       "Bash(chmod:*)",
       "Bash(git init:*)",
       "Bash(find:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git -C /Users/sivangalamidi/Development/invoice_automation status --porcelain)",
+      "Bash(git -C /Users/sivangalamidi/Development/invoice_automation ls-files)",
+      "Bash(git check-ignore:*)",
+      "Bash(git -C /Users/sivangalamidi/Development/invoice_automation log --all --full-history --source --remotes -- credentials.json token.json)",
+      "Bash(git -C /Users/sivangalamidi/Development/invoice_automation log --oneline --all)",
+      "Bash(git -C /Users/sivangalamidi/Development/invoice_automation diff HEAD credentials.json)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)"
     ]
   }
 }
