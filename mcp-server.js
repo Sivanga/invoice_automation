@@ -87,6 +87,97 @@ async function removeIgnoredSender(name) {
 
 // ── Gmail Helper Functions ───────────────────────────────────────────────────
 
+async function fetchRecentEmails(gmail, hoursBack = 24) {
+  const queries = [
+    `newer_than:${hoursBack}h subject:(invoice OR invoicing OR inv OR bill OR "balance due" OR "amount due" OR "payment required" OR overdue OR "pay now") -label:"${UNPAID_LABEL_NAME}"`,
+    `newer_than:${hoursBack}h -label:"${UNPAID_LABEL_NAME}" in:inbox`
+  ];
+
+  const allMessages = new Map();
+
+  for (const q of queries) {
+    const { data } = await gmail.users.messages.list({
+      userId: "me",
+      q,
+      maxResults: 50
+    });
+    for (const msg of data.messages || []) {
+      allMessages.set(msg.id, msg);
+    }
+  }
+
+  return [...allMessages.values()];
+}
+
+async function fetchMessageDetails(gmail, messageId) {
+  const { data } = await gmail.users.messages.get({
+    userId: "me",
+    id: messageId,
+    format: "metadata",
+    metadataHeaders: ["From", "Subject", "Date"]
+  });
+
+  const getHeader = (name) =>
+    data.payload.headers.find(h => h.name.toLowerCase() === name.toLowerCase())?.value || "";
+
+  return {
+    id: messageId,
+    threadId: data.threadId,
+    from: getHeader("From"),
+    subject: getHeader("Subject"),
+    date: getHeader("Date"),
+    snippet: data.snippet
+  };
+}
+
+async function classifyWithClaude(emails) {
+  if (emails.length === 0) return [];
+
+  const emailList = emails.map((e, i) =>
+    `[${i}] From: ${e.from}\nSubject: ${e.subject}\nSnippet: ${e.snippet}`
+  ).join("\n\n");
+
+  const response = await anthropic.messages.create({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1000,
+    system: `You are classifying emails to determine if they require the recipient to make a payment.
+
+Return ONLY a JSON array of indices (0-based) of emails that are actionable invoices.
+
+INCLUDE: invoices, bills, payment due notices, subscription renewals, overdue notices,
+         insurance excess letters, invoicing platform emails (Xero, QuickBooks, Stripe, etc.)
+         Subjects with patterns like "INV-1234", "GBP 450.00", "due date"
+
+EXCLUDE: promotions, receipts for already-paid transactions, newsletters,
+         "you've been paid" notifications, marketing, general announcements
+
+Return format: [0, 2, 5] or [] if none qualify. No explanation, just the JSON array.`,
+    messages: [{
+      role: "user",
+      content: `Classify these emails:\n\n${emailList}`
+    }]
+  });
+
+  const text = response.content[0].text.trim();
+  try {
+    return JSON.parse(text);
+  } catch {
+    console.error("Failed to parse Claude classification:", text);
+    return [];
+  }
+}
+
+async function applyUnpaidLabel(gmail, messageId, labelId) {
+  await gmail.users.messages.modify({
+    userId: "me",
+    id: messageId,
+    requestBody: {
+      addLabelIds: [labelId],
+      removeLabelIds: []
+    }
+  });
+}
+
 async function getOrCreateLabel(gmail, name) {
   const { data } = await gmail.users.labels.list({ userId: "me" });
   const existing = data.labels.find(l => l.name === name);
@@ -170,6 +261,20 @@ No explanation, just the number.`,
 
 const tools = [
   {
+    name: "detect_invoices",
+    description: "Scan recent Gmail messages, classify them with Claude, and label new invoices as '💳 Unpaid'. Returns a summary of newly detected invoices.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        hours_back: {
+          type: "number",
+          description: "How many hours back to search (default: 24)"
+        }
+      },
+      required: []
+    }
+  },
+  {
     name: "scan_invoices",
     description: "Search Gmail for emails labeled '💳 Unpaid' and return a structured list of unpaid invoices",
     inputSchema: {
@@ -235,6 +340,73 @@ async function handleToolCall(name, args) {
   const gmail = await getGmailClient();
 
   switch (name) {
+    case "detect_invoices": {
+      const hoursBack = args.hours_back || 24;
+
+      const messages = await fetchRecentEmails(gmail, hoursBack);
+
+      if (messages.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              detected: 0,
+              message: `No candidate emails found in the last ${hoursBack} hours`,
+              invoices: []
+            }, null, 2)
+          }]
+        };
+      }
+
+      const details = await Promise.all(
+        messages.map(m => fetchMessageDetails(gmail, m.id))
+      );
+
+      const ignoredSenders = await loadIgnoredSenders();
+      const filtered = details.filter(e => {
+        const fromLower = e.from.toLowerCase();
+        return !ignoredSenders.some(s => fromLower.includes(s));
+      });
+
+      if (filtered.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              detected: 0,
+              message: "All candidate emails were from ignored senders",
+              invoices: []
+            }, null, 2)
+          }]
+        };
+      }
+
+      const invoiceIndices = await classifyWithClaude(filtered);
+      const invoices = invoiceIndices.map(i => filtered[i]).filter(Boolean);
+
+      const labelId = await getOrCreateLabel(gmail, UNPAID_LABEL_NAME);
+      for (const email of invoices) {
+        await applyUnpaidLabel(gmail, email.id, labelId);
+      }
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            detected: invoices.length,
+            scanned: messages.length,
+            hours_back: hoursBack,
+            invoices: invoices.map(e => ({
+              from: e.from,
+              subject: e.subject,
+              date: e.date,
+              snippet: e.snippet
+            }))
+          }, null, 2)
+        }]
+      };
+    }
+
     case "scan_invoices":
     case "list_unpaid": {
       const emails = await fetchUnpaidEmails(gmail);
@@ -429,7 +601,7 @@ async function runServer() {
   await server.connect(transport);
 
   console.error("Invoice Tracker MCP server running on stdio");
-  console.error("Tools available: scan_invoices, mark_paid, list_unpaid, add_ignored_sender, remove_ignored_sender");
+  console.error("Tools available: detect_invoices, scan_invoices, mark_paid, list_unpaid, add_ignored_sender, remove_ignored_sender");
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
